@@ -9,6 +9,11 @@ struct ContentView: View {
     @State private var editText = ""
     @FocusState private var addFocused: Bool
     @FocusState private var editFocused: Bool
+    @State private var dragID: Int64?
+    @State private var dragOffset: CGFloat = 0
+    @State private var windowDragStart: (mouse: NSPoint, origin: NSPoint)?
+
+    private let rowHeight: CGFloat = 26
 
     /// Inline edit of a task's name or today's logged time.
     struct Editing: Equatable {
@@ -35,6 +40,25 @@ struct ContentView: View {
             VisualEffect()
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         )
+        .contentShape(Rectangle())
+        .gesture(windowDrag) // task rows' own drag gesture takes precedence
+    }
+
+    /// Moves the panel. Tracks the screen-space mouse so the moving window doesn't feed back
+    /// into the gesture's coordinates.
+    private var windowDrag: some Gesture {
+        DragGesture(minimumDistance: 2)
+            .onChanged { _ in
+                guard let window = NSApp.windows.first(where: { $0 is FloatingPanel }) else { return }
+                let mouse = NSEvent.mouseLocation
+                let start = windowDragStart ?? (mouse, window.frame.origin)
+                windowDragStart = start
+                window.setFrameOrigin(NSPoint(
+                    x: start.origin.x + mouse.x - start.mouse.x,
+                    y: start.origin.y + mouse.y - start.mouse.y
+                ))
+            }
+            .onEnded { _ in windowDragStart = nil }
     }
 
     // MARK: Sections
@@ -95,25 +119,53 @@ struct ContentView: View {
 
     private var taskList: some View {
         let open = model.openTasks
-        return List {
-            ForEach(open) { task in
-                row(task)
-                    .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
-                    .listRowSeparator(.hidden)
-                    .listRowBackground(Color.clear)
+        let from = open.firstIndex { $0.id == dragID }
+        let to = from.map { min(max($0 + Int((dragOffset / rowHeight).rounded()), 0), open.count - 1) }
+        return ScrollView {
+            VStack(spacing: 0) {
+                ForEach(Array(open.enumerated()), id: \.element.id) { index, task in
+                    row(task)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color(nsColor: .windowBackgroundColor))
+                                .opacity(task.id == dragID ? 1 : 0)
+                        )
+                        .frame(height: rowHeight)
+                        .offset(y: rowOffset(index, task.id, from: from, to: to))
+                        .zIndex(task.id == dragID ? 1 : 0)
+                        .shadow(color: .black.opacity(task.id == dragID ? 0.2 : 0), radius: 4, y: 1)
+                        .animation(task.id == dragID ? nil : .easeOut(duration: 0.12), value: to)
+                        .gesture(
+                            DragGesture(minimumDistance: 4, coordinateSpace: .named("taskList"))
+                                .onChanged { value in
+                                    dragID = task.id
+                                    dragOffset = value.translation.height
+                                }
+                                .onEnded { _ in
+                                    if let from, let to, from != to {
+                                        var ids = open.map(\.id)
+                                        ids.move(fromOffsets: [from], toOffset: to > from ? to + 1 : to)
+                                        model.reorder(ids)
+                                    }
+                                    dragID = nil
+                                    dragOffset = 0
+                                }
+                        )
+                }
             }
-            .onMove { from, to in
-                var ids = open.map(\.id)
-                ids.move(fromOffsets: from, toOffset: to)
-                model.reorder(ids)
-            }
+            .coordinateSpace(name: "taskList")
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
+        .frame(height: min(CGFloat(open.count), 8) * rowHeight)
         .scrollIndicators(.never)
-        .environment(\.defaultMinListRowHeight, 26)
-        .frame(height: min(CGFloat(open.count) * 26, 26 * 8))
-        .padding(.horizontal, -8) // cancel the List's built-in row inset
+    }
+
+    /// The dragged row follows the pointer; rows between its old and new slot shift to make room.
+    private func rowOffset(_ index: Int, _ id: Int64, from: Int?, to: Int?) -> CGFloat {
+        guard let from, let to else { return 0 }
+        if id == dragID { return dragOffset }
+        if from < to, index > from, index <= to { return -rowHeight }
+        if to < from, index >= to, index < from { return rowHeight }
+        return 0
     }
 
     private func row(_ task: TaskItem) -> some View {
@@ -184,6 +236,9 @@ struct ContentView: View {
     private func beginEdit(_ id: Int64, _ field: Editing.Field, text: String) {
         editText = text
         editing = Editing(id: id, field: field)
+        // A context-menu pick doesn't make the non-activating panel key (a click
+        // in a text field would), so keystrokes would still go to the previous app.
+        NSApp.windows.first { $0 is FloatingPanel }?.makeKey()
         DispatchQueue.main.async { editFocused = true }
     }
 

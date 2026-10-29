@@ -25,7 +25,11 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 final class Database {
     private var db: OpaquePointer?
 
+    /// `CRONOM_DB` overrides the location, e.g. for a scratch or demo database.
     static func openDefault() throws -> Database {
+        if let path = ProcessInfo.processInfo.environment["CRONOM_DB"] {
+            return try Database(path: path)
+        }
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Cronom", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
