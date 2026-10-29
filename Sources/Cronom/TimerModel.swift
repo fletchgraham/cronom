@@ -124,6 +124,20 @@ final class TimerModel: ObservableObject {
         reload()
     }
 
+    func reorder(_ ids: [Int64]) {
+        db.reorder(ids)
+        reload()
+    }
+
+    /// Set today's logged time on a task by recording the difference as a correction.
+    func setTodayTime(_ id: Int64, seconds: Double) {
+        guard let task = tasks.first(where: { $0.id == id }) else { return }
+        let delta = max(0, seconds) - task.todaySeconds
+        guard abs(delta) >= 1 else { return }
+        db.addAdjustment(taskID: id, seconds: delta)
+        reload()
+    }
+
     func markDone(_ id: Int64) {
         if id == activeTaskID {
             let others = openTasks.filter { $0.id != id }

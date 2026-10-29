@@ -5,9 +5,17 @@ struct ContentView: View {
     @EnvironmentObject var model: TimerModel
     @AppStorage("showList") private var showList = true
     @State private var newTask = ""
-    @State private var renaming: Int64?
-    @State private var renameText = ""
+    @State private var editing: Editing?
+    @State private var editText = ""
     @FocusState private var addFocused: Bool
+    @FocusState private var editFocused: Bool
+
+    /// Inline edit of a task's name or today's logged time.
+    struct Editing: Equatable {
+        enum Field { case name, time }
+        let id: Int64
+        let field: Field
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -87,13 +95,25 @@ struct ContentView: View {
 
     private var taskList: some View {
         let open = model.openTasks
-        return ScrollView {
-            VStack(spacing: 2) {
-                ForEach(open) { task in row(task) }
+        return List {
+            ForEach(open) { task in
+                row(task)
+                    .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+            }
+            .onMove { from, to in
+                var ids = open.map(\.id)
+                ids.move(fromOffsets: from, toOffset: to)
+                model.reorder(ids)
             }
         }
-        .frame(height: min(CGFloat(open.count) * 26, 26 * 8))
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
         .scrollIndicators(.never)
+        .environment(\.defaultMinListRowHeight, 26)
+        .frame(height: min(CGFloat(open.count) * 26, 26 * 8))
+        .padding(.horizontal, -8) // cancel the List's built-in row inset
     }
 
     private func row(_ task: TaskItem) -> some View {
@@ -105,15 +125,10 @@ struct ContentView: View {
             .buttonStyle(IconButtonStyle(size: 11))
             .help("Mark done")
 
-            if renaming == task.id {
-                TextField("", text: $renameText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .onSubmit {
-                        model.rename(task.id, to: renameText)
-                        renaming = nil
-                    }
-                    .onExitCommand { renaming = nil }
+            if editing == Editing(id: task.id, field: .name) {
+                inlineField {
+                    model.rename(task.id, to: editText)
+                }
             } else {
                 Text(task.name)
                     .font(.system(size: 12, weight: active ? .semibold : .regular))
@@ -121,11 +136,21 @@ struct ContentView: View {
                     .truncationMode(.tail)
             }
             Spacer(minLength: 4)
-            Text(duration(task.todaySeconds))
-                .font(.system(size: 11))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .help("Today · \(duration(task.totalSeconds)) all time")
+            if editing == Editing(id: task.id, field: .time) {
+                inlineField {
+                    if let seconds = parseDuration(editText) {
+                        model.setTodayTime(task.id, seconds: seconds)
+                    }
+                }
+                .multilineTextAlignment(.trailing)
+                .frame(width: 60)
+            } else {
+                Text(duration(task.todaySeconds))
+                    .font(.system(size: 11))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .help("Today · \(duration(task.totalSeconds)) all time")
+            }
         }
         .padding(.horizontal, 6)
         .frame(height: 24)
@@ -136,14 +161,30 @@ struct ContentView: View {
         .contentShape(Rectangle())
         .onTapGesture { model.select(task.id) }
         .contextMenu {
-            Button("Rename") {
-                renameText = task.name
-                renaming = task.id
-            }
+            Button("Rename") { beginEdit(task.id, .name, text: task.name) }
+            Button("Edit time today…") { beginEdit(task.id, .time, text: duration(task.todaySeconds)) }
             Button("Mark done") { model.markDone(task.id) }
             Divider()
             Button("Delete", role: .destructive) { model.delete(task.id) }
         }
+    }
+
+    private func inlineField(commit: @escaping () -> Void) -> some View {
+        TextField("", text: $editText)
+            .textFieldStyle(.plain)
+            .font(.system(size: 12))
+            .focused($editFocused)
+            .onSubmit {
+                commit()
+                editing = nil
+            }
+            .onExitCommand { editing = nil }
+    }
+
+    private func beginEdit(_ id: Int64, _ field: Editing.Field, text: String) {
+        editText = text
+        editing = Editing(id: id, field: field)
+        DispatchQueue.main.async { editFocused = true }
     }
 
     private var addField: some View {
@@ -213,6 +254,24 @@ struct ContentView: View {
         return s >= 3600
             ? String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
             : String(format: "%02d:%02d", s / 60, s % 60)
+    }
+
+    /// Accepts "45", "45m", "1h", "1h 30m", "1:30". Bare numbers are minutes.
+    private func parseDuration(_ text: String) -> Double? {
+        let s = text.lowercased().trimmingCharacters(in: .whitespaces)
+        if let colon = s.firstIndex(of: ":") {
+            guard let h = Double(s[..<colon]), let m = Double(s[s.index(after: colon)...]) else { return nil }
+            return (h * 60 + m) * 60
+        }
+        if let m = Double(s) { return m * 60 }
+        func number(before unit: String) -> Double? {
+            let re = try! Regex("(\\d+(?:\\.\\d+)?)\\s*\(unit)")
+            return s.firstMatch(of: re).flatMap { $0.output[1].substring }.flatMap { Double($0) }
+        }
+        let hours = number(before: "h")
+        let mins = number(before: "m")
+        guard hours != nil || mins != nil else { return nil }
+        return ((hours ?? 0) * 60 + (mins ?? 0)) * 60
     }
 
     private func duration(_ t: Double) -> String {

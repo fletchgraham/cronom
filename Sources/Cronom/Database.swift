@@ -19,8 +19,9 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 /// Thin SQLite wrapper. Times are stored as unix seconds (REAL).
 ///
 /// Schema:
-///   tasks(id, name, done, created_at)
-///   segments(id, task_id, start, end) — one row per stretch of focused time on a task.
+///   tasks(id, name, done, created_at, position)
+///   segments(id, task_id, start, end, manual) — one row per stretch of focused time on a task.
+///     Manual rows are time corrections; their end - start may be negative.
 final class Database {
     private var db: OpaquePointer?
 
@@ -53,6 +54,22 @@ final class Database {
             CREATE INDEX IF NOT EXISTS segments_task ON segments(task_id);
             CREATE INDEX IF NOT EXISTS segments_start ON segments(start);
             """)
+        try migrate()
+    }
+
+    private func migrate() throws {
+        var version: Int32 = 0
+        query("PRAGMA user_version") { version = sqlite3_column_int($0, 0) }
+        if version < 1 {
+            try exec("""
+                BEGIN;
+                ALTER TABLE tasks ADD COLUMN position REAL NOT NULL DEFAULT 0;
+                UPDATE tasks SET position = id;
+                ALTER TABLE segments ADD COLUMN manual INTEGER NOT NULL DEFAULT 0;
+                PRAGMA user_version = 1;
+                COMMIT;
+                """)
+        }
     }
 
     deinit { sqlite3_close(db) }
@@ -61,8 +78,20 @@ final class Database {
 
     @discardableResult
     func addTask(name: String) -> Int64 {
-        run("INSERT INTO tasks (name, created_at) VALUES (?, ?)", .text(name), .real(Date().timeIntervalSince1970))
+        run("""
+            INSERT INTO tasks (name, created_at, position)
+            VALUES (?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM tasks))
+            """, .text(name), .real(Date().timeIntervalSince1970))
         return sqlite3_last_insert_rowid(db)
+    }
+
+    /// Rewrite positions so tasks sort in the given order.
+    func reorder(_ ids: [Int64]) {
+        try? exec("BEGIN")
+        for (i, id) in ids.enumerated() {
+            run("UPDATE tasks SET position = ? WHERE id = ?", .real(Double(i)), .int(id))
+        }
+        try? exec("COMMIT")
     }
 
     func setDone(_ id: Int64, _ done: Bool) {
@@ -85,7 +114,7 @@ final class Database {
                    COALESCE(SUM(s.end - s.start), 0)
             FROM tasks t LEFT JOIN segments s ON s.task_id = t.id
             GROUP BY t.id
-            ORDER BY t.done, t.id
+            ORDER BY t.done, t.position, t.id
             """
         var items: [TaskItem] = []
         query(sql, .real(dayStart.timeIntervalSince1970)) { stmt in
@@ -110,6 +139,13 @@ final class Database {
 
     func updateSegment(_ id: Int64, end date: Date) {
         run("UPDATE segments SET end = ? WHERE id = ?", .real(date.timeIntervalSince1970), .int(id))
+    }
+
+    /// Record a manual correction of `seconds` (positive or negative) against a task, dated now.
+    func addAdjustment(taskID: Int64, seconds: Double) {
+        let t = Date().timeIntervalSince1970
+        run("INSERT INTO segments (task_id, start, end, manual) VALUES (?, ?, ?, 1)",
+            .int(taskID), .real(t), .real(t + seconds))
     }
 
     // MARK: Plumbing
